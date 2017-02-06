@@ -183,7 +183,7 @@ public final class KafkaSparkAnalytics {
 	    			System.out.println(parseddata.rdd());
 	    			
 	    			// Building the model - gives good values with numIter = 10 and stepSize = 0.1
-	    		    int numIterations = 1;
+	    		    int numIterations = 10;
 	    		    double stepSize = 0.1;
 	    		    LinearRegressionModel model = LinearRegressionWithSGD.train(
 	    		    		JavaRDD.toRDD(parseddata), numIterations, stepSize); // notice the .rdd()
