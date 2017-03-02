@@ -19,8 +19,10 @@ import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.api.java.function.FlatMapFunction;
 import org.apache.spark.api.java.function.Function;
 import org.apache.spark.api.java.function.Function2;
+import org.apache.spark.mllib.feature.StandardScaler;
 import org.apache.spark.sql.DataFrame;
 import org.apache.spark.sql.Row;
+import org.apache.spark.sql.SQLContext;
 import org.apache.spark.sql.hive.HiveContext;
 import org.apache.spark.streaming.Durations;
 import org.apache.spark.streaming.Time;
@@ -38,6 +40,7 @@ import scala.reflect.ClassTag;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.spark.mllib.regression.LinearRegressionWithSGD;
+import org.apache.spark.mllib.feature.StandardScalerModel;
 import org.apache.spark.mllib.linalg.Vector;
 import org.apache.spark.mllib.linalg.Vectors;
 import org.apache.spark.mllib.regression.LabeledPoint;
@@ -68,11 +71,13 @@ public final class KafkaSparkAnalytics {
 
 		String brokers = args[0];
 		String topics = args[1];
+		String numIterationsArgs = args[2];
+		String stepSizeArgs = args[3];
 
 		// Create context with a 5 seconds batch interval
-		SparkConf sparkConf = new SparkConf().setAppName("JavaDirectKafkaWordCount");
+		SparkConf sparkConf = new SparkConf().setAppName("JavaDirectKafkaSpark");
 		JavaSparkContext jsc = new JavaSparkContext(sparkConf);
-		JavaStreamingContext jssc = new JavaStreamingContext(jsc, Durations.seconds(5));
+		JavaStreamingContext jssc = new JavaStreamingContext(jsc, Durations.seconds(10));
 
 		Set<String> topicsSet = new HashSet<>(Arrays.asList(topics.split(",")));
 	    Map<String, String> kafkaParams = new HashMap<>();
@@ -97,7 +102,7 @@ public final class KafkaSparkAnalytics {
 		JavaPairInputDStream<String, String> messages = KafkaUtils.createDirectStream(jssc, String.class, String.class,
 				StringDecoder.class, StringDecoder.class, kafkaParams, topicsSet);
 
-		// Get the lines, split them into words, count the words and print
+		// Get the lines, split them into words and print
 		 JavaDStream<String> lines = messages.map(new Function<Tuple2<String,String>, String>() {
 		 @Override
 		 public String call(Tuple2<String, String> tuple2) {
@@ -156,7 +161,7 @@ public final class KafkaSparkAnalytics {
 	    			
 	    			
 	    			//ML Streaming linear regression - For Training on Streaming Data in micro-batches but Prediction on Static Data at time-point n	    			    			
-	    		    				
+	    		    
 	    			JavaRDD<LabeledPoint> parseddata = record
 	    		            .map(new Function<String, LabeledPoint>() {
 	    		            
@@ -168,35 +173,78 @@ public final class KafkaSparkAnalytics {
 	    		                    double[] points = new double[pointsStr.length];
 	    		                
 	    		                    for (int i = 0; i < points.length; i++)
-	   		                    		points[i] = Double.valueOf(pointsStr[i])/50;
+	   		                    		points[i] = Double.valueOf(pointsStr[i]);
 	  	    		                    
 	    		                    return new LabeledPoint(Double.valueOf(parts[0]), //Assume first data sent is timepoint, followed by lat
 	    		                            Vectors.dense(points));
 	    		                }
 	    		            });
 	    			
-	    			parseddata.cache();
-
-	                 
+ 			
+	    			//DataFrame dfFrame = hc.createDataFrame(parseddata, LabeledPoint.class);
+	    			//dfFrame.printSchema();
+	    			
+	    			StandardScaler scaler = new StandardScaler();
+	    			
+		    		StandardScalerModel scalerModel = scaler.fit(JavaRDD.toRDD(parseddata.map(x -> x.features())));
+//		    		JavaRDD<Vector> scaledFeatures = scalerModel.transform(JavaRDD.toRDD(parseddata.map(x -> x.features())))
+//			    										.toJavaRDD();
+		    
+		    		
 	    			System.out.println("Parsed data: ");
 	    			System.out.println(parseddata.collect());
 	    			System.out.println(parseddata.rdd());
 	    			
+	    			
+	    			//Recreating scaledData with scaled values
+	    			JavaRDD<LabeledPoint> scaledData = parseddata.map(
+	    					new Function<LabeledPoint, LabeledPoint>() {
+	    		    	        public LabeledPoint call(LabeledPoint point) {
+		    		    	        return new LabeledPoint(point.label(), scalerModel.transform(point.features()));
+		    		    	     }
+	    		    	      }
+	    		    	    );
+	    					
+	    			
+	    			System.out.println("Scaled data: ");
+	    			System.out.println(scaledData.collect());
+
+	    			//caching rdd's
+	    			parseddata.cache();
+	    			scaledData.cache();
+	    			
 	    			// Building the model - gives good values with numIter = 10 and stepSize = 0.1
-	    		    int numIterations = 10;
-	    		    double stepSize = 0.1;
+	    		    int numIterations;
+	    		    double stepSize;
+
+	    		    if(numIterationsArgs.equals(""))
+	    		    	numIterations = 10;
+	    		    else
+	    		    	numIterations = Integer.parseInt(numIterationsArgs);
+	    		    
+	    		    if(stepSizeArgs.equals(""))
+	    		    	stepSize = 0.1;
+	    		    else
+	    		    	stepSize = Double.parseDouble(stepSizeArgs);
+	    		    
+	    		    
 	    		    LinearRegressionModel model = LinearRegressionWithSGD.train(
-	    		    		JavaRDD.toRDD(parseddata), numIterations, stepSize); // notice the .rdd()
+	    		    		JavaRDD.toRDD(scaledData), numIterations, stepSize); // notice the .rdd()
 	    		    
 	    		    //JavaRDD<LabeledPoint> testData = new JavaRDD
 	    		    
+	    		    //USE StandardScaler for scaling/normalizing input data
+	    		    //CHECK whether model.predict() returns weights or not
+	    		    
+  		    
+	    		    	    		    
 	    		    // Evaluate model on training examples and compute training error
-	    		    JavaRDD<Tuple3<Double, Double, Vector>> valuesAndPred = parseddata.map(
+	    		    JavaRDD<Tuple3<Double, Double, Vector>> valuesAndPred = scaledData.map(
 	    		    	     new Function<LabeledPoint, Tuple3<Double, Double, Vector>>() {
 	    		    	        public Tuple3<Double, Double, Vector> call(LabeledPoint point) {
 		    		    	          double prediction = model.predict(point.features());
 	    		    	        	  //double prediction = model.predict(Vectors.dense([5.0]));
-		    		    	          return new Tuple3<Double, Double, Vector>(prediction*50, point.label(), point.features());
+		    		    	          return new Tuple3<Double, Double, Vector>(prediction, point.label(), point.features());
 		    		    	     }
 	    		    	      }
 	    		    	    );
@@ -205,6 +253,7 @@ public final class KafkaSparkAnalytics {
 	    		            .map(point -> new Tuple2<Double, Double>(point.label(), model
 	    		                    .predict(point.features())));
 	    		    */
+	    		    //try using model.intercept and model.weights
 	    		    
 	    		    System.out.println(valuesAndPred.collect());
 	    		    
