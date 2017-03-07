@@ -19,6 +19,8 @@ import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.api.java.function.FlatMapFunction;
 import org.apache.spark.api.java.function.Function;
 import org.apache.spark.api.java.function.Function2;
+import org.apache.spark.ml.evaluation.RegressionEvaluator;
+import org.apache.spark.mllib.evaluation.RegressionMetrics;
 import org.apache.spark.mllib.feature.StandardScaler;
 import org.apache.spark.sql.DataFrame;
 import org.apache.spark.sql.Row;
@@ -41,11 +43,15 @@ import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.spark.mllib.regression.LinearRegressionWithSGD;
 import org.apache.spark.mllib.feature.StandardScalerModel;
+import org.apache.spark.mllib.linalg.DenseVector;
 import org.apache.spark.mllib.linalg.Vector;
 import org.apache.spark.mllib.linalg.Vectors;
+import org.apache.spark.mllib.optimization.SimpleUpdater;
+import org.apache.spark.mllib.optimization.SquaredL2Updater;
 import org.apache.spark.mllib.regression.LabeledPoint;
 import org.apache.spark.mllib.regression.LinearRegressionModel;
 import org.apache.spark.mllib.regression.StreamingLinearRegressionWithSGD;
+import org.apache.spark.mllib.stat.Statistics;
 
 /**
  * Consumes messages from one or more topics in Kafka and does wordcount. Usage:
@@ -73,6 +79,8 @@ public final class KafkaSparkAnalytics {
 		String topics = args[1];
 		String numIterationsArgs = args[2];
 		String stepSizeArgs = args[3];
+		String convergenceTolArgs = args[4];
+		String initWeightArgs = args[5];
 
 		// Create context with a 5 seconds batch interval
 		SparkConf sparkConf = new SparkConf().setAppName("JavaDirectKafkaSpark");
@@ -80,13 +88,12 @@ public final class KafkaSparkAnalytics {
 		JavaStreamingContext jssc = new JavaStreamingContext(jsc, Durations.seconds(10));
 
 		Set<String> topicsSet = new HashSet<>(Arrays.asList(topics.split(",")));
-	    Map<String, String> kafkaParams = new HashMap<>();
+		Map<String, String> kafkaParams = new HashMap<>();
 		kafkaParams.put("metadata.broker.list", brokers);
 
+		// Initialise Hive Query variables
+		System.out.println("STARTING HIVE QUERY...................!!!!!!!!!!!!!");
 
-		//Initialise Hive Query variables
-	 	System.out.println("STARTING HIVE QUERY...................!!!!!!!!!!!!!");
-		
 		@SuppressWarnings("deprecation")
 		HiveContext hc = new HiveContext(jsc);
 
@@ -96,227 +103,332 @@ public final class KafkaSparkAnalytics {
 		reviews_orc.registerTempTable("reviews");
 
 		restaurants_orc.registerTempTable("restaurants");
-		
 
 		// Create direct kafka stream with brokers and topics
 		JavaPairInputDStream<String, String> messages = KafkaUtils.createDirectStream(jssc, String.class, String.class,
 				StringDecoder.class, StringDecoder.class, kafkaParams, topicsSet);
 
 		// Get the lines, split them into words and print
-		 JavaDStream<String> lines = messages.map(new Function<Tuple2<String,String>, String>() {
-		 @Override
-		 public String call(Tuple2<String, String> tuple2) {
-			 return tuple2._2();
-		 	}
-		 });
-		 
-		 JavaDStream<String> words = lines.flatMap(new FlatMapFunction<String, String>() {
-			 @Override
-			 public Iterable<String> call(String x){
-				 return Arrays.asList(SPACE.split(x));
-			 }
-		});
-
-	    words.print();
-
-	    //ML For Prediction on Streaming Data
-	    /*
-	    int numFeatures = 2;
-   
-	    StreamingLinearRegressionWithSGD model = new StreamingLinearRegressionWithSGD().setInitialWeights(Vectors.zeros(numFeatures));	    
-	    	
-	    JavaDStream<LabeledPoint> trainingData = words.map(new Function<String, LabeledPoint>() {
-	    	@Override
-	    	public LabeledPoint call(String w){
-	    		double lat = Double.parseDouble(w);
-	    		return new LabeledPoint(1.0, Vectors.dense(1.0,lat));
-	    	}
-		});
-	    
-	    model.trainOn(trainingData);
-	    //model.predictOn(Vectors.dense(5.0));
-	    
-	    //JavaDStream<String> javaDStream = new JavaDStream<String>(dstream, scala.reflect.ClassTag$.MODULE$.apply(String.class));
-	    		
-	    model.pr
-	    
-	    model.predictOn(trainingData.dstream().map(new Function<LabeledPoint, Vector>() {
-
+		JavaDStream<String> lines = messages.map(new Function<Tuple2<String, String>, String>() {
 			@Override
-			public Vector call(LabeledPoint arg0){
-				// TODO Auto-generated method stub
-				return null;
+			public String call(Tuple2<String, String> tuple2) {
+				return tuple2._2();
 			}
-	    	
-	    }, ClassTag<Vector>));
-	    
-	    
-	    */
+		});
 
-	    words.foreachRDD(record -> {
-	    	if(!record.isEmpty())
-	    		{
-	    			System.out.println("Input found!!! " + record.collect() );
-	    			System.out.println("First: " + record.first() );
-	    			
-	    			
-	    			//ML Streaming linear regression - For Training on Streaming Data in micro-batches but Prediction on Static Data at time-point n	    			    			
-	    		    
-	    			JavaRDD<LabeledPoint> parseddata = record
-	    		            .map(new Function<String, LabeledPoint>() {
-	    		            
-	    		                @Override
-	    		                public LabeledPoint call(String lat) throws Exception {
-	    		                    String[] parts = lat.split(",");
-	    		                    String[] pointsStr = parts[1].split(" ");	    		                	 
-	    		                	// Here assume I publish all training values to Kafka topic together in a single message with comma separated
-	    		                    double[] points = new double[pointsStr.length];
-	    		                
-	    		                    for (int i = 0; i < points.length; i++)
-	   		                    		points[i] = Double.valueOf(pointsStr[i]);
-	  	    		                    
-	    		                    return new LabeledPoint(Double.valueOf(parts[0]), //Assume first data sent is timepoint, followed by lat
-	    		                            Vectors.dense(points));
-	    		                }
-	    		            });
-	    			
- 			
-	    			//DataFrame dfFrame = hc.createDataFrame(parseddata, LabeledPoint.class);
-	    			//dfFrame.printSchema();
-	    			
-	    			StandardScaler scaler = new StandardScaler();
-	    			
-		    		StandardScalerModel scalerModel = scaler.fit(JavaRDD.toRDD(parseddata.map(x -> x.features())));
-//		    		JavaRDD<Vector> scaledFeatures = scalerModel.transform(JavaRDD.toRDD(parseddata.map(x -> x.features())))
-//			    										.toJavaRDD();
-		    
-		    		
-	    			System.out.println("Parsed data: ");
-	    			System.out.println(parseddata.collect());
-	    			System.out.println(parseddata.rdd());
-	    			
-	    			
-	    			//Recreating scaledData with scaled values
-	    			JavaRDD<LabeledPoint> scaledData = parseddata.map(
-	    					new Function<LabeledPoint, LabeledPoint>() {
-	    		    	        public LabeledPoint call(LabeledPoint point) {
-		    		    	        return new LabeledPoint(point.label(), scalerModel.transform(point.features()));
-		    		    	     }
-	    		    	      }
-	    		    	    );
-	    					
-	    			
-	    			System.out.println("Scaled data: ");
-	    			System.out.println(scaledData.collect());
+		JavaDStream<String> words = lines.flatMap(new FlatMapFunction<String, String>() {
+			@Override
+			public Iterable<String> call(String x) {
+				return Arrays.asList(SPACE.split(x));
+			}
+		});
 
-	    			//caching rdd's
-	    			parseddata.cache();
-	    			scaledData.cache();
-	    			
-	    			// Building the model - gives good values with numIter = 10 and stepSize = 0.1
-	    		    int numIterations;
-	    		    double stepSize;
+		words.print();
 
-	    		    if(numIterationsArgs.equals(""))
-	    		    	numIterations = 10;
-	    		    else
-	    		    	numIterations = Integer.parseInt(numIterationsArgs);
-	    		    
-	    		    if(stepSizeArgs.equals(""))
-	    		    	stepSize = 0.1;
-	    		    else
-	    		    	stepSize = Double.parseDouble(stepSizeArgs);
-	    		    
-	    		    
-	    		    LinearRegressionModel model = LinearRegressionWithSGD.train(
-	    		    		JavaRDD.toRDD(scaledData), numIterations, stepSize); // notice the .rdd()
-	    		    
-	    		    //JavaRDD<LabeledPoint> testData = new JavaRDD
-	    		    
-	    		    //USE StandardScaler for scaling/normalizing input data
-	    		    //CHECK whether model.predict() returns weights or not
-	    		    
-  		    
-	    		    	    		    
-	    		    // Evaluate model on training examples and compute training error
-	    		    JavaRDD<Tuple3<Double, Double, Vector>> valuesAndPred = scaledData.map(
-	    		    	     new Function<LabeledPoint, Tuple3<Double, Double, Vector>>() {
-	    		    	        public Tuple3<Double, Double, Vector> call(LabeledPoint point) {
-		    		    	          double prediction = model.predict(point.features());
-	    		    	        	  //double prediction = model.predict(Vectors.dense([5.0]));
-		    		    	          return new Tuple3<Double, Double, Vector>(prediction, point.label(), point.features());
-		    		    	     }
-	    		    	      }
-	    		    	    );
-	    		    
-	    		    /*JavaRDD<Tuple2<Double, Double>> valuesAndPred = parseddata
-	    		            .map(point -> new Tuple2<Double, Double>(point.label(), model
-	    		                    .predict(point.features())));
-	    		    */
-	    		    //try using model.intercept and model.weights
-	    		    
-	    		    System.out.println(valuesAndPred.collect());
-	    		    
-	    		    double MSE = new JavaDoubleRDD(valuesAndPred.map(
-	    		    	      new Function<Tuple3<Double, Double, Vector>, Object>() {
-	    		    	        public Object call(Tuple3<Double, Double, Vector> pair) {
-	    		    	          return Math.pow(pair._1() - pair._2(), 2.0);
-	    		    	        }
-	    		    	      }
-	    		    	    ).rdd()).mean();
-	    		    	    System.out.println("training Mean Squared Error = " + MSE);
-	    		    
-	    		    
-	    			//Next is Querying data with result of ML	
-	    		    /*
-	    			double lat = Double.parseDouble(record.first());
-	    			double lat1 = lat - 0.05;
-	    			double lat2 = lat + 0.05;
-	    			
-	    			hc.setConf("LAT1", String.valueOf(lat1));
-	    			hc.setConf("LAT2", String.valueOf(lat2));
-	    		
-	    			DataFrame resultRow = hc.sql("select reviews.reviewer_id, restaurants.category, restaurants.lat, restaurants.lng,"
-			x			+" avg(reviews.rating) as avg_rating from restaurants.reviews,"
-						+" restaurants.restaurants where reviews.restaurant_id == restaurants.id"
-						+" and reviews.rating> '4'" 
-						+" and restaurants.lat between '${hiveconf:LAT1}' and '${hiveconf:LAT2}' and"
-						+" restaurants.lng between 13.3 and 13.4"
-						+" group by reviews.reviewer_id, restaurants.lat, restaurants.lng, restaurants.category LIMIT 5");
-   			
-	    			List<String> result = resultRow.javaRDD().map(new Function<Row, String>() {
-	    				public String call(Row x) throws Exception {
-	    					return x.getString(0);
-	    				}
-	    			}).collect();
-	    			
-	    			System.out.println(result);
-	    			*/
-	    		    
-	    			/*
-	    			//Pushing output to KafkaProducer	    			
-	    			
-	    			HashMap<String,Object> props = new HashMap<>();
-                	props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, brokers);
-                	props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, "org.apache.kafka.common.serialization.StringSerializer");
-                	props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, "org.apache.kafka.common.serialization.StringSerializer");
-                	KafkaProducer<String, String> producer = new KafkaProducer<>(props);
-	    			
-                	ProducerRecord<String, String> output = new ProducerRecord<>("MyTest", result.get(0)); 
-                	//Now send/push to kafka output topic
-                	producer.send(output);
-                	producer.close();
-                	*/
-	    		}
-	    });
-	    
-	    
-	    
-	 // Start the computation
-	 		jssc.start();
-	 		
-	 		jssc.awaitTermination();
-		
-		
+		// ML For Prediction on Streaming Data
+		/*
+		 * int numFeatures = 2;
+		 * 
+		 * StreamingLinearRegressionWithSGD model = new
+		 * StreamingLinearRegressionWithSGD().setInitialWeights(Vectors.zeros(
+		 * numFeatures));
+		 * 
+		 * JavaDStream<LabeledPoint> trainingData = words.map(new
+		 * Function<String, LabeledPoint>() {
+		 * 
+		 * @Override public LabeledPoint call(String w){ double lat =
+		 * Double.parseDouble(w); return new LabeledPoint(1.0,
+		 * Vectors.dense(1.0,lat)); } });
+		 * 
+		 * model.trainOn(trainingData); //model.predictOn(Vectors.dense(5.0));
+		 * 
+		 * //JavaDStream<String> javaDStream = new JavaDStream<String>(dstream,
+		 * scala.reflect.ClassTag$.MODULE$.apply(String.class));
+		 * 
+		 * model.pr
+		 * 
+		 * model.predictOn(trainingData.dstream().map(new Function<LabeledPoint,
+		 * Vector>() {
+		 * 
+		 * @Override public Vector call(LabeledPoint arg0){ // TODO
+		 * Auto-generated method stub return null; }
+		 * 
+		 * }, ClassTag<Vector>));
+		 * 
+		 * 
+		 */
+
+		HashMap<String, Object> props = new HashMap<>();
+		props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, brokers);
+		props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG,
+				"org.apache.kafka.common.serialization.StringSerializer");
+		props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, "org.apache.kafka.common.serialization.StringSerializer");
+
+		words.foreachRDD(record -> {
+			if (!record.isEmpty()) {
+				System.out.println("Input found!!! " + record.collect());
+				System.out.println("First: " + record.first());
+
+				// ML Streaming linear regression - For Training on Streaming
+				// Data in micro-batches but Prediction on Static Data at
+				// time-point n
+
+				JavaRDD<LabeledPoint> parseddata = record.map(new Function<String, LabeledPoint>() {
+
+					@Override
+					public LabeledPoint call(String lat) throws Exception {
+						String[] parts = lat.split(",");
+						String pointsStr = parts[1].trim();
+						// Here assume I publish all training values to Kafka
+						// topic together in a single message with comma
+						// separated
+						//double[] points = new double[pointsStr.length];
+						double[] points = new double[1];
+						
+						//for (int i = 0; i < points.length; i++)
+							//points[i] = Double.valueOf(pointsStr);
+						points[0] = Double.parseDouble(pointsStr);
+
+						return new LabeledPoint(Double.parseDouble(parts[0]), Vectors.dense(points)); 
+								//Assume first data sent is lat, timepoint
+								
+					}
+				});
+				
+				
+				// DataFrame dfFrame = hc.createDataFrame(parseddata,
+				// LabeledPoint.class);
+				// dfFrame.printSchema();
+
+				/*StandardScaler scaler = new StandardScaler();
+
+				StandardScalerModel scalerModel = scaler.fit(JavaRDD.toRDD(parseddata.map(x -> x.features())));
+				// JavaRDD<Vector> scaledFeatures =
+				// scalerModel.transform(JavaRDD.toRDD(parseddata.map(x ->
+				// x.features())))
+				// .toJavaRDD();
+				
+				
+				// Recreating scaledData with scaled values
+				JavaRDD<LabeledPoint> scaledData = parseddata.map(new Function<LabeledPoint, LabeledPoint>() {
+					public LabeledPoint call(LabeledPoint point) {
+						return new LabeledPoint(point.label(), scalerModel.transform(point.features()));
+					}
+				});
+
+				System.out.println("Scaled data: ");
+				System.out.println(scaledData.collect());
+				*/
+				// caching rdd's
+				parseddata.cache();
+//				scaledData.cache();
+
+				//Calculate mean
+				JavaRDD<Vector> LatData = record.map(new Function<String, Vector>() {
+
+					@Override
+					public Vector call(String lat) throws Exception {
+						String[] parts = lat.split(",");
+						//String pointsStr = parts[1].trim();
+						double[] points = new double[1];
+						
+						//for (int i = 0; i < points.length; i++)
+							//points[i] = Double.valueOf(pointsStr);
+						points[0] = Double.valueOf(parts[0]);
+
+						return Vectors.dense(points); 								
+					}
+				});
+
+				System.out.println("Mean: " + Statistics.colStats(LatData.rdd()).mean());
+				
+				
+				//Collect stats
+				JavaRDD<Vector> inputData = record.map(new Function<String, Vector>() {
+
+					@Override
+					public Vector call(String lat) throws Exception {
+						String[] parts = lat.split(",");
+						//String pointsStr = parts[1].trim();
+						double[] points = new double[2];
+						
+						//for (int i = 0; i < points.length; i++)
+							//points[i] = Double.valueOf(pointsStr);
+						points[0] = Double.valueOf(parts[0]);
+						points[1] = Double.valueOf(parts[1]);
+
+						return Vectors.dense(points); 								
+					}
+				});
+
+				System.out.println("Printing Stats: ");
+				System.out.println(Statistics.corr(inputData.rdd()));
+				
+				System.out.println("Parsed data: ");
+				System.out.println(parseddata.collect());
+				System.out.println(parseddata.rdd());
+
+
+				// Building the model - gives good values with numIter = 10 and
+				// stepSize = 0.1
+				int numIterations;
+				double stepSize;
+				double convergenceTol;
+				double initWeight;
+
+				if (numIterationsArgs.equals(""))
+					numIterations = 10;
+				else
+					numIterations = Integer.parseInt(numIterationsArgs);
+
+				if (stepSizeArgs.equals(""))
+					stepSize = 0.1;
+				else
+					stepSize = Double.parseDouble(stepSizeArgs);
+				
+				if (convergenceTolArgs.equals(""))
+					convergenceTol = 0.0001;
+				else
+					convergenceTol = Double.parseDouble(convergenceTolArgs);
+				
+				initWeight = Double.parseDouble(initWeightArgs);
+				
+				LinearRegressionWithSGD lr = new LinearRegressionWithSGD();
+				lr.setIntercept(true);
+				
+				lr.optimizer().setNumIterations(numIterations)
+						.setStepSize(stepSize)
+						.setUpdater(new SquaredL2Updater())
+						//.setMiniBatchFraction(0.9);
+						.setConvergenceTol(convergenceTol)
+						.setRegParam(0.000001);
+				
+						
+				Vector initialWeights = Vectors.dense(initWeight);
+				
+				LinearRegressionModel model = lr.run(JavaRDD.toRDD(parseddata), initialWeights);
+				
+				System.out.println("NumFeatures: "+lr.getNumFeatures());
+				
+				//LinearRegressionModel model = LinearRegressionWithSGD.train(JavaRDD.toRDD(parseddata), numIterations);
+					 // notice the .rdd()
+
+				// JavaRDD<LabeledPoint> testData = new JavaRDD
+
+				// USE StandardScaler for scaling/normalizing input data
+				// CHECK whether model.predict() returns weights or not
+
+				// Evaluate model on training examples and compute training
+				// error
+				/*JavaRDD<Tuple3<Double, Double, Vector>> valuesPredAndFeatures = parseddata
+						.map(new Function<LabeledPoint, Tuple3<Double, Double, Vector>>() {
+							public Tuple3<Double, Double, Vector> call(LabeledPoint point) {
+								double prediction = model.predict(point.features());
+								// double prediction =
+								// model.predict(Vectors.dense([5.0]));
+								return new Tuple3<Double, Double, Vector>(prediction, point.label(), point.features());
+							}
+						});
+				*/
+				JavaRDD<Tuple2<Double, Double>> valuesAndPred = parseddata
+						.map(new Function<LabeledPoint, Tuple2<Double, Double>>() {
+							public Tuple2<Double, Double> call(LabeledPoint point) {
+								double prediction = model.predict(point.features());
+								// double prediction =
+								// model.predict(Vectors.dense([5.0]));
+								return new Tuple2<Double, Double>(prediction, point.label());
+							}
+						});
+				
+				System.out.println("Intercept: " + model.intercept());
+				System.out.println("Weights: "+ model.weights());
+				/*
+				DataFrame dfPred = hc.createDataFrame(valuesAndPred, Tuple2.class);
+				DataFrame dfEval= dfPred.select("prediction","label");
+				
+				RegressionEvaluator eval = new RegressionEvaluator().setMetricName("r2").
+						setLabelCol("label").setPredictionCol("prediction");
+				System.out.println("R2: " + eval.evaluate(dfEval));				
+				*/
+				
+				JavaRDD<Tuple2<Object, Object>> valuesAndPredObj = parseddata
+						.map(new Function<LabeledPoint, Tuple2<Object, Object>>() {
+							public Tuple2<Object, Object> call(LabeledPoint point) {
+								double prediction = model.predict(point.features());
+								// double prediction =
+								// model.predict(Vectors.dense([5.0]));
+								return new Tuple2<Object, Object>(prediction, point.label());
+							}
+						});
+				
+				
+				RegressionMetrics eval2 = new RegressionMetrics(valuesAndPredObj.rdd());
+				
+				System.out.println("r2: "+ eval2.r2());
+				System.out.println("RMSE: "+eval2.rootMeanSquaredError());
+				
+				/*
+				 * JavaRDD<Tuple2<Double, Double>> valuesAndPred = parseddata
+				 * .map(point -> new Tuple2<Double, Double>(point.label(), model
+				 * .predict(point.features())));
+				 */
+				// try using model.intercept and model.weights
+
+				System.out.println(valuesAndPred.collect());
+				/*
+				 * double MSE = new JavaDoubleRDD(valuesAndPred.map( new
+				 * Function<Tuple3<Double, Double, Vector>, Object>() { public
+				 * Object call(Tuple3<Double, Double, Vector> pair) { return
+				 * Math.pow(pair._1() - pair._2(), 2.0); } } ).rdd()).mean();
+				 * System.out.println("training Mean Squared Error = " + MSE);
+				 */
+
+				// Next is Querying data with result of ML
+				/*
+				 * double lat = Double.parseDouble(record.first()); double lat1
+				 * = lat - 0.0005; double lat2 = lat + 0.0005;
+				 * 
+				 * hc.setConf("LAT1", String.valueOf(lat1)); hc.setConf("LAT2",
+				 * String.valueOf(lat2));
+				 * 
+				 * DataFrame resultRow = hc.
+				 * sql("select reviews.reviewer_id, restaurants.category, restaurants.lat, restaurants.lng,"
+				 * +" avg(reviews.rating) as avg_rating from restaurants.reviews,"
+				 * +" restaurants.restaurants where reviews.restaurant_id == restaurants.id"
+				 * +" and reviews.rating> '4'"
+				 * +" and restaurants.lat between '${hiveconf:LAT1}' and '${hiveconf:LAT2}' and"
+				 * +" restaurants.lng between 13.3 and 13.4"
+				 * +" group by reviews.reviewer_id, restaurants.lat, restaurants.lng, restaurants.category LIMIT 5"
+				 * );
+				 * 
+				 * List<String> result = null;
+				 * 
+				 * if(!resultRow.rdd().isEmpty()) { result =
+				 * resultRow.javaRDD().map(new Function<Row, String>() { public
+				 * String call(Row x) throws Exception { return x.getString(0);
+				 * } }).collect(); }
+				 * 
+				 * System.out.println("Result: " + result);
+				 * 
+				 */
+
+				// Pushing output to KafkaProducer
+				/*KafkaProducer<String, String> producer = new KafkaProducer<>(props);
+				// ProducerRecord<String, String> output = new ProducerRecord<String, String>("MyTest", result.get(0));
+				ProducerRecord<String, String> output = 
+						new ProducerRecord<String, String>("MyTest", valuesAndPred.collect().get(0).toString());
+
+				// Now send/push to kafka output topic
+				producer.send(output);
+				producer.close();*/
+
+			}
+		});
+
+		// Start the computation
+		jssc.start();
+
+		jssc.awaitTermination();
+
 	}
 }
