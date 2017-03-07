@@ -37,6 +37,7 @@ import org.apache.spark.streaming.kafka.KafkaUtils;
 import kafka.serializer.StringDecoder;
 import scala.Tuple2;
 import scala.Tuple3;
+import scala.collection.parallel.ParIterableLike.Foreach;
 import scala.reflect.ClassTag;
 
 import org.apache.kafka.clients.producer.ProducerConfig;
@@ -46,12 +47,15 @@ import org.apache.spark.mllib.feature.StandardScalerModel;
 import org.apache.spark.mllib.linalg.DenseVector;
 import org.apache.spark.mllib.linalg.Vector;
 import org.apache.spark.mllib.linalg.Vectors;
+import org.apache.spark.mllib.optimization.LBFGS;
+import org.apache.spark.mllib.optimization.LeastSquaresGradient;
 import org.apache.spark.mllib.optimization.SimpleUpdater;
 import org.apache.spark.mllib.optimization.SquaredL2Updater;
 import org.apache.spark.mllib.regression.LabeledPoint;
 import org.apache.spark.mllib.regression.LinearRegressionModel;
 import org.apache.spark.mllib.regression.StreamingLinearRegressionWithSGD;
 import org.apache.spark.mllib.stat.Statistics;
+import org.apache.spark.mllib.util.MLUtils;
 
 /**
  * Consumes messages from one or more topics in Kafka and does wordcount. Usage:
@@ -81,6 +85,8 @@ public final class KafkaSparkAnalytics {
 		String stepSizeArgs = args[3];
 		String convergenceTolArgs = args[4];
 		String initWeightArgs = args[5];
+		String regParamArgs = args[6];
+		String numCorrectionsArgs = args[7];
 
 		// Create context with a 5 seconds batch interval
 		SparkConf sparkConf = new SparkConf().setAppName("JavaDirectKafkaSpark");
@@ -189,7 +195,7 @@ public final class KafkaSparkAnalytics {
 							//points[i] = Double.valueOf(pointsStr);
 						points[0] = Double.parseDouble(pointsStr);
 
-						return new LabeledPoint(Double.parseDouble(parts[0]), Vectors.dense(points)); 
+						return new LabeledPoint(Double.parseDouble(parts[0]), MLUtils.appendBias(Vectors.dense(points))); 
 								//Assume first data sent is lat, timepoint
 								
 					}
@@ -293,6 +299,61 @@ public final class KafkaSparkAnalytics {
 				
 				initWeight = Double.parseDouble(initWeightArgs);
 				
+				//WithLBFGS
+
+				JavaRDD<Tuple2<Object,Vector>> lbfdata = record.map(new Function<String, Tuple2<Object,Vector>>() {
+
+					@Override
+					public Tuple2<Object,Vector> call(String lat) throws Exception {
+						String[] parts = lat.split(",");
+						String pointsStr = parts[1].trim();
+						// Here assume I publish all training values to Kafka
+						// topic together in a single message with comma
+						// separated
+						//double[] points = new double[pointsStr.length];
+						double[] points = new double[1];
+						
+						//for (int i = 0; i < points.length; i++)
+							//points[i] = Double.valueOf(pointsStr);
+						points[0] = Double.parseDouble(pointsStr);
+
+						return new Tuple2<Object,Vector> (Double.parseDouble(parts[0]), MLUtils.appendBias(Vectors.dense(points))); 
+								//Assume first data sent is lat, timepoint
+								
+					}
+				});
+
+				JavaRDD<Tuple2<Object, Vector>>[] splitInput = lbfdata.randomSplit(new double[] {0.9,0.1});
+				
+				JavaRDD<Tuple2<Object, Vector>> trainData = splitInput[0].cache();
+				JavaRDD<Tuple2<Object, Vector>> testData = splitInput[1].cache();
+				
+				int maxNumIterations = numIterations;
+				double regParam = Double.parseDouble(regParamArgs);
+				int numCorrections = Integer.parseInt(numCorrectionsArgs);
+				
+				Tuple2<Vector, double[]> lbfConf = LBFGS.runLBFGS(trainData.rdd(),
+						new LeastSquaresGradient(),
+						new SquaredL2Updater(),
+						numCorrections,
+						convergenceTol,
+						maxNumIterations,
+						regParam,
+						Vectors.dense(0.0,0.0));//initialWeightsWithIntercept
+				
+				Vector weightsWithIntercept = lbfConf._1;
+				double[] loss = lbfConf._2;
+				
+				System.out.println("WeightswithIntercept: "+ weightsWithIntercept);
+				System.out.println("loss: "+ loss.toString());
+				
+				LinearRegressionModel lbfModel = new LinearRegressionModel(
+						Vectors.dense(Arrays.copyOfRange(weightsWithIntercept.toArray(),0,
+								weightsWithIntercept.toArray().length-1)),
+						weightsWithIntercept.toArray()[weightsWithIntercept.toArray().length - 1]			
+						);
+				//End of LBFGS
+			/*
 				LinearRegressionWithSGD lr = new LinearRegressionWithSGD();
 				lr.setIntercept(true);
 				
@@ -309,7 +370,7 @@ public final class KafkaSparkAnalytics {
 				LinearRegressionModel model = lr.run(JavaRDD.toRDD(parseddata), initialWeights);
 				
 				System.out.println("NumFeatures: "+lr.getNumFeatures());
-				
+				*/
 				//LinearRegressionModel model = LinearRegressionWithSGD.train(JavaRDD.toRDD(parseddata), numIterations);
 					 // notice the .rdd()
 
@@ -330,18 +391,34 @@ public final class KafkaSparkAnalytics {
 							}
 						});
 				*/
-				JavaRDD<Tuple2<Double, Double>> valuesAndPred = parseddata
-						.map(new Function<LabeledPoint, Tuple2<Double, Double>>() {
-							public Tuple2<Double, Double> call(LabeledPoint point) {
-								double prediction = model.predict(point.features());
-								// double prediction =
-								// model.predict(Vectors.dense([5.0]));
-								return new Tuple2<Double, Double>(prediction, point.label());
+				JavaRDD<Tuple2<Double, Double>> valuesAndPred = testData
+						.map(new Function<Tuple2<Object,Vector>, Tuple2<Double, Double>>() {
+							public Tuple2<Double, Double> call(Tuple2<Object,Vector> point) {
+								double prediction = lbfModel.predict(Vectors.dense(point._2.apply(0)));
+								return new Tuple2<Double, Double>(prediction, (Double) point._1);
 							}
 						});
 				
-				System.out.println("Intercept: " + model.intercept());
-				System.out.println("Weights: "+ model.weights());
+				
+				/*Tuple2<Double, Double> valuesAndPred = parseddata.collect().forEach(
+						{point -> 
+								double prediction = lbfModel.predict(point.features());
+								return new Tuple2<Double, Double>(prediction, point.label());
+							
+						});
+				 */
+				
+				System.out.println("Intercept: " + lbfModel.intercept());
+				System.out.println("Weights: "+ lbfModel.weights());
+				System.out.println("Predictions: "+ valuesAndPred.collect());				
+				
+				JavaRDD<Tuple2<Object, Object>> valuesAndPredObj = testData
+				.map(new Function<Tuple2<Object,Vector>, Tuple2<Object, Object>>() {
+					public Tuple2<Object, Object> call(Tuple2<Object,Vector> point) {
+						double prediction = lbfModel.predict(Vectors.dense(point._2.apply(0)));
+						return new Tuple2<Object, Object>(prediction, point._1);
+					}
+				});
 				/*
 				DataFrame dfPred = hc.createDataFrame(valuesAndPred, Tuple2.class);
 				DataFrame dfEval= dfPred.select("prediction","label");
@@ -351,16 +428,16 @@ public final class KafkaSparkAnalytics {
 				System.out.println("R2: " + eval.evaluate(dfEval));				
 				*/
 				
-				JavaRDD<Tuple2<Object, Object>> valuesAndPredObj = parseddata
+				/*JavaRDD<Tuple2<Object, Object>> valuesAndPredObj = parseddata
 						.map(new Function<LabeledPoint, Tuple2<Object, Object>>() {
 							public Tuple2<Object, Object> call(LabeledPoint point) {
-								double prediction = model.predict(point.features());
+								double prediction = lbfModel.predict(point.features());
 								// double prediction =
 								// model.predict(Vectors.dense([5.0]));
 								return new Tuple2<Object, Object>(prediction, point.label());
 							}
 						});
-				
+				*/
 				
 				RegressionMetrics eval2 = new RegressionMetrics(valuesAndPredObj.rdd());
 				
@@ -374,7 +451,7 @@ public final class KafkaSparkAnalytics {
 				 */
 				// try using model.intercept and model.weights
 
-				System.out.println(valuesAndPred.collect());
+
 				/*
 				 * double MSE = new JavaDoubleRDD(valuesAndPred.map( new
 				 * Function<Tuple3<Double, Double, Vector>, Object>() { public
