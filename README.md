@@ -13,7 +13,7 @@ Follow the below steps to clone code and setup your machine.
 
 ## 2. Getting code
 
-           git clone https://github.com/
+           git clone https://github.com/saion-chatterjee/bigdata-analytics.git
 
 
 ## 3. Build
@@ -36,7 +36,7 @@ scp or git pull latest jar file before executing on cluster Driver machine.
 The code is configured to be deployed in a yarn managed cluster with spark-submit. 
 
 Sample submission script:
-./spark-submit --class com.saion.KafkaSparkAnalytics --master yarn --deploy-mode client /tmp/kafka-spark-0.0.1-SNAPSHOT.jar <kafkaBrokerIP>:6667 MyKafkaTest 100 0.01 0.00001 0 0.0001 5
+./spark-submit --class com.saion.KafkaSparkAnalytics --master yarn --deploy-mode client /tmp/kafka-spark-0.0.1-SNAPSHOT.jar 'kafkaBrokerIP':6667 MyKafkaTest 100 0.01 0.00001 0 0.0001 5
 
 Please ensure to start a Kafka Publisher and Consumer before executing this program else it will fail in runtime.
 
