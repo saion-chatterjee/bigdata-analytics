@@ -2,6 +2,7 @@
 
 This repository contains code for bigData Analytics using Kafka and Spark streaming.
 (Flink to come)
+
 Follow the below steps to clone code and setup your machine.
 
 
@@ -37,6 +38,10 @@ The code is configured to be deployed in a yarn managed cluster with spark-submi
 
 Sample submission script:
 ./spark-submit --class com.saion.KafkaSparkAnalytics --master yarn --deploy-mode client /tmp/kafka-spark-0.0.1-SNAPSHOT.jar 'kafkaBrokerIP':6667 MyKafkaTest 100 0.01 0.00001 0 0.0001 5
+
+
+Please read code comments for semantics of the parameters
+
 
 Please ensure to start a Kafka Publisher and Consumer before executing this program else it will fail in runtime.
 
