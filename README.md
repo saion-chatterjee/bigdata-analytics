@@ -37,6 +37,7 @@ scp or git pull latest jar file before executing on cluster Driver machine.
 The code is configured to be deployed in a yarn managed cluster with spark-submit. 
 
 Sample submission script:
+
 ./spark-submit --class com.saion.KafkaSparkAnalytics --master yarn --deploy-mode client /tmp/kafka-spark-0.0.1-SNAPSHOT.jar 'kafkaBrokerIP':6667 MyKafkaTest 100 0.01 0.00001 0 0.0001 5
 
 
