@@ -2,6 +2,7 @@
 package com.saion;
 
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -14,6 +15,7 @@ import java.util.stream.Collectors;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.spark.SparkConf;
 import org.apache.spark.api.java.JavaDoubleRDD;
+import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.api.java.function.FlatMapFunction;
@@ -35,9 +37,13 @@ import org.apache.spark.streaming.dstream.DStream;
 import org.apache.spark.streaming.kafka.KafkaUtils;
 
 import kafka.serializer.StringDecoder;
+import scala.Array;
+import scala.Function1;
+import scala.Some;
 import scala.Tuple2;
 import scala.Tuple3;
 import scala.collection.parallel.ParIterableLike.Foreach;
+import scala.math.Ordering;
 import scala.reflect.ClassTag;
 
 import org.apache.kafka.clients.producer.ProducerConfig;
@@ -56,6 +62,7 @@ import org.apache.spark.mllib.regression.LinearRegressionModel;
 import org.apache.spark.mllib.regression.StreamingLinearRegressionWithSGD;
 import org.apache.spark.mllib.stat.Statistics;
 import org.apache.spark.mllib.util.MLUtils;
+import org.apache.spark.rdd.RDD;
 
 /**
  * Consumes messages from one or more topics in Kafka and does wordcount. Usage:
@@ -70,13 +77,19 @@ public final class KafkaSparkAnalytics {
 	private static final Pattern SPACE = Pattern.compile(" ");
 
 	public static void main(String[] args) throws Exception {
-		if (args.length < 2) {
-			System.err.println("Usage: KafkaWordCount <brokers> <topics>\n"
+		if (args.length < 8) {
+			System.err.println("Usage: KafkaSparkAnalytics <brokers> <topics>\n"
 					+ "  <brokers> is a list of one or more Kafka brokers\n"
-					+ "  <topics> is a list of one or more kafka topics to consume from\n\n");
+					+ "  <topics> is a list of one or more kafka topics to consume from\n"
+					+ "  <numIter> is the number of iterations for LinearRegression\n"
+					+ "  <stepSize> is the stepSize for LinearRegression\n"
+					+ "  <convergenceTol> is the convergence tolerance for LinearRegression\n"
+					+ "  <initWeight> is the initial weight vector for LinearRegression\n"
+					+ "  <regParam> is the regularization parameter for LinearRegression\n"
+					+ "  <numCorrections> is the number of corrections for LBFGS Linear Reg\n\n");
 			System.exit(1);
 		}
-
+ 
 		// StreamingExamples.setStreamingLogLevels();
 
 		String brokers = args[0];
@@ -88,7 +101,7 @@ public final class KafkaSparkAnalytics {
 		String regParamArgs = args[6];
 		String numCorrectionsArgs = args[7];
 
-		// Create context with a 5 seconds batch interval
+		// Create context with a 10 seconds batch interval
 		SparkConf sparkConf = new SparkConf().setAppName("JavaDirectKafkaSpark");
 		JavaSparkContext jsc = new JavaSparkContext(sparkConf);
 		JavaStreamingContext jssc = new JavaStreamingContext(jsc, Durations.seconds(10));
@@ -98,11 +111,12 @@ public final class KafkaSparkAnalytics {
 		kafkaParams.put("metadata.broker.list", brokers);
 
 		// Initialise Hive Query variables
-		System.out.println("STARTING HIVE QUERY...................!!!!!!!!!!!!!");
+		System.out.println("INITIALIZING HIVE VARS...................");
 
 		@SuppressWarnings("deprecation")
 		HiveContext hc = new HiveContext(jsc);
 
+		//Loading DataFrames
 		DataFrame reviews_orc = hc.read().format("orc").load("/apps/hive/warehouse/restaurants.db/reviews");
 		DataFrame restaurants_orc = hc.read().format("orc").load("/apps/hive/warehouse/restaurants.db/restaurants");
 
@@ -131,82 +145,22 @@ public final class KafkaSparkAnalytics {
 
 		words.print();
 
-		// ML For Prediction on Streaming Data
-		/*
-		 * int numFeatures = 2;
-		 * 
-		 * StreamingLinearRegressionWithSGD model = new
-		 * StreamingLinearRegressionWithSGD().setInitialWeights(Vectors.zeros(
-		 * numFeatures));
-		 * 
-		 * JavaDStream<LabeledPoint> trainingData = words.map(new
-		 * Function<String, LabeledPoint>() {
-		 * 
-		 * @Override public LabeledPoint call(String w){ double lat =
-		 * Double.parseDouble(w); return new LabeledPoint(1.0,
-		 * Vectors.dense(1.0,lat)); } });
-		 * 
-		 * model.trainOn(trainingData); //model.predictOn(Vectors.dense(5.0));
-		 * 
-		 * //JavaDStream<String> javaDStream = new JavaDStream<String>(dstream,
-		 * scala.reflect.ClassTag$.MODULE$.apply(String.class));
-		 * 
-		 * model.pr
-		 * 
-		 * model.predictOn(trainingData.dstream().map(new Function<LabeledPoint,
-		 * Vector>() {
-		 * 
-		 * @Override public Vector call(LabeledPoint arg0){ // TODO
-		 * Auto-generated method stub return null; }
-		 * 
-		 * }, ClassTag<Vector>));
-		 * 
-		 * 
-		 */
-
+		//Defining Kafka Broker Params for Publishing
 		HashMap<String, Object> props = new HashMap<>();
 		props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, brokers);
 		props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG,
 				"org.apache.kafka.common.serialization.StringSerializer");
 		props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, "org.apache.kafka.common.serialization.StringSerializer");
 
+		//ForeachRDD
 		words.foreachRDD(record -> {
-			if (!record.isEmpty()) {
-				System.out.println("Input found!!! " + record.collect());
-				System.out.println("First: " + record.first());
+			if (!record.isEmpty()) { //Filtering out empty rdd's
+				//System.out.println("Input found!!! " + record.collect());
+				//System.out.println("First: " + record.first());
 
-				// ML Streaming linear regression - For Training on Streaming
-				// Data in micro-batches but Prediction on Static Data at
-				// time-point n
 
-				JavaRDD<LabeledPoint> parseddata = record.map(new Function<String, LabeledPoint>() {
-
-					@Override
-					public LabeledPoint call(String lat) throws Exception {
-						String[] parts = lat.split(",");
-						String pointsStr = parts[1].trim();
-						// Here assume I publish all training values to Kafka
-						// topic together in a single message with comma
-						// separated
-						//double[] points = new double[pointsStr.length];
-						double[] points = new double[1];
-						
-						//for (int i = 0; i < points.length; i++)
-							//points[i] = Double.valueOf(pointsStr);
-						points[0] = Double.parseDouble(pointsStr);
-
-						return new LabeledPoint(Double.parseDouble(parts[0]), MLUtils.appendBias(Vectors.dense(points))); 
-								//Assume first data sent is lat, timepoint
-								
-					}
-				});
-				
-				
-				// DataFrame dfFrame = hc.createDataFrame(parseddata,
-				// LabeledPoint.class);
-				// dfFrame.printSchema();
-
-				/*StandardScaler scaler = new StandardScaler();
+				/* Needed in case of Feature Scaling
+				 StandardScaler scaler = new StandardScaler();
 
 				StandardScalerModel scalerModel = scaler.fit(JavaRDD.toRDD(parseddata.map(x -> x.features())));
 				// JavaRDD<Vector> scaledFeatures =
@@ -225,11 +179,10 @@ public final class KafkaSparkAnalytics {
 				System.out.println("Scaled data: ");
 				System.out.println(scaledData.collect());
 				*/
-				// caching rdd's
-				parseddata.cache();
-//				scaledData.cache();
+				//scaledData.cache();
 
-				//Calculate mean
+				//For analyzing statistics on incoming data
+				/*
 				JavaRDD<Vector> LatData = record.map(new Function<String, Vector>() {
 
 					@Override
@@ -273,34 +226,24 @@ public final class KafkaSparkAnalytics {
 				System.out.println("Parsed data: ");
 				System.out.println(parseddata.collect());
 				System.out.println(parseddata.rdd());
+*/
+				
+				// ML linear regression - For Training on Streaming
+				// Data in micro-batches 
 
 
-				// Building the model - gives good values with numIter = 10 and
-				// stepSize = 0.1
 				int numIterations;
 				double stepSize;
 				double convergenceTol;
 				double initWeight;
 
-				if (numIterationsArgs.equals(""))
-					numIterations = 10;
-				else
-					numIterations = Integer.parseInt(numIterationsArgs);
-
-				if (stepSizeArgs.equals(""))
-					stepSize = 0.1;
-				else
-					stepSize = Double.parseDouble(stepSizeArgs);
-				
-				if (convergenceTolArgs.equals(""))
-					convergenceTol = 0.0001;
-				else
-					convergenceTol = Double.parseDouble(convergenceTolArgs);
-				
+				numIterations = Integer.parseInt(numIterationsArgs);
+				stepSize = Double.parseDouble(stepSizeArgs);
+				convergenceTol = Double.parseDouble(convergenceTolArgs);
 				initWeight = Double.parseDouble(initWeightArgs);
 				
-				//WithLBFGS
-
+				//Parsing for LBFGS
+				
 				JavaRDD<Tuple2<Object,Vector>> lbfdata = record.map(new Function<String, Tuple2<Object,Vector>>() {
 
 					@Override
@@ -310,23 +253,29 @@ public final class KafkaSparkAnalytics {
 						// Here assume I publish all training values to Kafka
 						// topic together in a single message with comma
 						// separated
-						//double[] points = new double[pointsStr.length];
+
 						double[] points = new double[1];
 						
-						//for (int i = 0; i < points.length; i++)
-							//points[i] = Double.valueOf(pointsStr);
 						points[0] = Double.parseDouble(pointsStr);
 
 						return new Tuple2<Object,Vector> (Double.parseDouble(parts[0]), MLUtils.appendBias(Vectors.dense(points))); 
-								//Assume first data sent is lat, timepoint
+								//Assume first data sent is pos, timepoint
 								
 					}
 				});
-
-				JavaRDD<Tuple2<Object, Vector>>[] splitInput = lbfdata.randomSplit(new double[] {0.9,0.1});
 				
-				JavaRDD<Tuple2<Object, Vector>> trainData = splitInput[0].cache();
-				JavaRDD<Tuple2<Object, Vector>> testData = splitInput[1].cache();
+				lbfdata.cache();
+				
+				//JavaRDD<Tuple2<Object, Vector>>[] splitInput = lbfdata.randomSplit(new double[] {0.9,0.1});
+				
+				JavaRDD<Tuple2<Object, Vector>> trainData = lbfdata; //splitInput[0].cache();
+				JavaRDD<Tuple2<Object, Vector>> testData = lbfdata; //splitInput[1].cache();
+
+				//Building the test data
+				
+				Tuple2<Object, Vector> a = lbfdata.collect().get(lbfdata.collect().size()-1);
+				
+				//Building the model
 				
 				int maxNumIterations = numIterations;
 				double regParam = Double.parseDouble(regParamArgs);
@@ -353,7 +302,9 @@ public final class KafkaSparkAnalytics {
 						weightsWithIntercept.toArray()[weightsWithIntercept.toArray().length - 1]			
 						);
 				//End of LBFGS
-			/*
+			
+				//If LR with SGD - uncomment below lines
+				/*
 				LinearRegressionWithSGD lr = new LinearRegressionWithSGD();
 				lr.setIntercept(true);
 				
@@ -371,6 +322,7 @@ public final class KafkaSparkAnalytics {
 				
 				System.out.println("NumFeatures: "+lr.getNumFeatures());
 				*/
+				
 				//LinearRegressionModel model = LinearRegressionWithSGD.train(JavaRDD.toRDD(parseddata), numIterations);
 					 // notice the .rdd()
 
@@ -385,12 +337,11 @@ public final class KafkaSparkAnalytics {
 						.map(new Function<LabeledPoint, Tuple3<Double, Double, Vector>>() {
 							public Tuple3<Double, Double, Vector> call(LabeledPoint point) {
 								double prediction = model.predict(point.features());
-								// double prediction =
-								// model.predict(Vectors.dense([5.0]));
 								return new Tuple3<Double, Double, Vector>(prediction, point.label(), point.features());
 							}
 						});
 				*/
+				
 				JavaRDD<Tuple2<Double, Double>> valuesAndPred = testData
 						.map(new Function<Tuple2<Object,Vector>, Tuple2<Double, Double>>() {
 							public Tuple2<Double, Double> call(Tuple2<Object,Vector> point) {
@@ -399,26 +350,19 @@ public final class KafkaSparkAnalytics {
 							}
 						});
 				
-				
-				/*Tuple2<Double, Double> valuesAndPred = parseddata.collect().forEach(
-						{point -> 
-								double prediction = lbfModel.predict(point.features());
-								return new Tuple2<Double, Double>(prediction, point.label());
-							
-						});
-				 */
-				
+								
 				System.out.println("Intercept: " + lbfModel.intercept());
 				System.out.println("Weights: "+ lbfModel.weights());
 				System.out.println("Predictions: "+ valuesAndPred.collect());				
 				
+				/* In order to print out statistics of predictions - uncomment below lines
 				JavaRDD<Tuple2<Object, Object>> valuesAndPredObj = testData
 				.map(new Function<Tuple2<Object,Vector>, Tuple2<Object, Object>>() {
 					public Tuple2<Object, Object> call(Tuple2<Object,Vector> point) {
 						double prediction = lbfModel.predict(Vectors.dense(point._2.apply(0)));
 						return new Tuple2<Object, Object>(prediction, point._1);
 					}
-				});
+				});*/
 				/*
 				DataFrame dfPred = hc.createDataFrame(valuesAndPred, Tuple2.class);
 				DataFrame dfEval= dfPred.select("prediction","label");
@@ -439,11 +383,11 @@ public final class KafkaSparkAnalytics {
 						});
 				*/
 				
-				RegressionMetrics eval2 = new RegressionMetrics(valuesAndPredObj.rdd());
+				/*RegressionMetrics eval2 = new RegressionMetrics(valuesAndPredObj.rdd());
 				
 				System.out.println("r2: "+ eval2.r2());
 				System.out.println("RMSE: "+eval2.rootMeanSquaredError());
-				
+				*/
 				/*
 				 * JavaRDD<Tuple2<Double, Double>> valuesAndPred = parseddata
 				 * .map(point -> new Tuple2<Double, Double>(point.label(), model
@@ -461,44 +405,51 @@ public final class KafkaSparkAnalytics {
 				 */
 
 				// Next is Querying data with result of ML
-				/*
-				 * double lat = Double.parseDouble(record.first()); double lat1
-				 * = lat - 0.0005; double lat2 = lat + 0.0005;
-				 * 
-				 * hc.setConf("LAT1", String.valueOf(lat1)); hc.setConf("LAT2",
-				 * String.valueOf(lat2));
-				 * 
-				 * DataFrame resultRow = hc.
-				 * sql("select reviews.reviewer_id, restaurants.category, restaurants.lat, restaurants.lng,"
-				 * +" avg(reviews.rating) as avg_rating from restaurants.reviews,"
-				 * +" restaurants.restaurants where reviews.restaurant_id == restaurants.id"
-				 * +" and reviews.rating> '4'"
-				 * +" and restaurants.lat between '${hiveconf:LAT1}' and '${hiveconf:LAT2}' and"
-				 * +" restaurants.lng between 13.3 and 13.4"
-				 * +" group by reviews.reviewer_id, restaurants.lat, restaurants.lng, restaurants.category LIMIT 5"
-				 * );
-				 * 
-				 * List<String> result = null;
-				 * 
-				 * if(!resultRow.rdd().isEmpty()) { result =
-				 * resultRow.javaRDD().map(new Function<Row, String>() { public
-				 * String call(Row x) throws Exception { return x.getString(0);
-				 * } }).collect(); }
-				 * 
-				 * System.out.println("Result: " + result);
-				 * 
-				 */
+				
+				  double lat = valuesAndPred.collect().get(0)._1; 
+				  double lat1 = lat - 0.0005; //Adjusting latitude values in order to scan for nearby restaurants
+				  double lat2 = lat + 0.0005;
+				   
+				  
+				  hc.setConf("LAT1", String.valueOf(lat1)); 
+				  hc.setConf("LAT2", String.valueOf(lat2));
+				  
+				  DataFrame resultRow = hc.
+				  sql("select reviews.reviewer_id, restaurants.category, restaurants.lat, restaurants.lng,"
+				  +" avg(reviews.rating) as avg_rating from restaurants.reviews,"
+				  +" restaurants.restaurants where reviews.restaurant_id == restaurants.id"
+				  +" and reviews.rating> '3'"
+				  +" and restaurants.lat between '${hiveconf:LAT1}' and '${hiveconf:LAT2}' and"
+				  +" restaurants.lng between 13.3 and 13.4"
+				  +" group by reviews.reviewer_id, restaurants.lat, restaurants.lng, restaurants.category LIMIT 5"
+				  );
+				  
+				  List<String> result = null;
+				  
+				  resultRow.write().mode("append").saveAsTable("restaurants.results");
+				  
+				  if(!resultRow.rdd().isEmpty()) { 
+					  result = resultRow.javaRDD().map(new Function<Row, String>() {
+						  public String call(Row x) throws Exception { 
+							  return x.getString(0);
+						  	} 
+						  }).collect(); 
+					  }
+				  
+				  System.out.println("Result: " + result);
+				  
+				 
 
 				// Pushing output to KafkaProducer
-				/*KafkaProducer<String, String> producer = new KafkaProducer<>(props);
+				KafkaProducer<String, String> producer = new KafkaProducer<>(props);
 				// ProducerRecord<String, String> output = new ProducerRecord<String, String>("MyTest", result.get(0));
 				ProducerRecord<String, String> output = 
 						new ProducerRecord<String, String>("MyTest", valuesAndPred.collect().get(0).toString());
 
 				// Now send/push to kafka output topic
 				producer.send(output);
-				producer.close();*/
 
+				 
 			}
 		});
 
